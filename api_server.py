@@ -1,37 +1,173 @@
-from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import create_engine, Column, Integer, Float, String, DateTime, Index
-from sqlalchemy.orm import declarative_base, sessionmaker
+from contextlib import asynccontextmanager
 import s3fs
 import xarray as xr
 import datetime
 import numpy as np
-import time
-import os
+import asyncio
+import threading
+import logging
 
-# Database Setup
-Base = declarative_base()
-engine = create_engine('sqlite:///smn_cache.db', connect_args={"check_same_thread": False})
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("agrospace")
 
-class Forecast(Base):
-    __tablename__ = "forecasts"
-    id = Column(Integer, primary_key=True, index=True)
-    lat = Column(Float, index=True)
-    lon = Column(Float, index=True)
-    cycle = Column(String) # To know which forecast cycle this belongs to
-    time = Column(DateTime, index=True)
-    temperature_2m = Column(Float)
-    relative_humidity_2m = Column(Float)
-    precipitation = Column(Float)
-    wind_speed_10m = Column(Float)
-    wind_direction_10m = Column(Float)
+# ─── In-memory forecast cache ──────────────────────────────────────────────
+# Structure: { "lat_lon_key": { "expires": datetime, "data": {...} } }
+CACHE: dict = {}
+DOWNLOADING: set = set()
 
-Base.metadata.create_all(bind=engine)
+# Known client coordinates — pre-loaded on startup
+KNOWN_CLIENTS = [
+    {"lat": -36.2086, "lon": -61.87869},  # Campo Marina Blasco
+]
 
-app = FastAPI(title="AgroSpace SMN WRF 4km API")
+def build_coord_key(lat: float, lon: float) -> str:
+    return f"{round(lat, 4)}_{round(lon, 4)}"
 
-# Setup CORS to allow the Hostinger dashboard to ping this API
+def find_nearest_idx(lats, lons, target_lat, target_lon):
+    dist = np.sqrt((lats - target_lat) ** 2 + (lons - target_lon) ** 2)
+    y_idx, x_idx = np.unravel_index(np.argmin(dist), dist.shape)
+    return int(y_idx), int(x_idx)
+
+def fetch_smn_data_sync(target_lat: float, target_lon: float):
+    """Synchronous worker — runs in a thread so it doesn't block the event loop."""
+    coord_key = build_coord_key(target_lat, target_lon)
+    if coord_key in DOWNLOADING:
+        return
+    DOWNLOADING.add(coord_key)
+
+    try:
+        fs = s3fs.S3FileSystem(anon=True)
+        now = datetime.datetime.utcnow()
+
+        # 1. Find latest available SMN cycle
+        s3_prefix = None
+        cycle_id = None
+        for hour_offset in range(48):
+            test_date = now - datetime.timedelta(hours=hour_offset)
+            yy = test_date.strftime("%Y")
+            mm = test_date.strftime("%m")
+            dd = test_date.strftime("%d")
+            cc = "12" if test_date.hour >= 12 else "00"
+            prefix = f"smn-ar-wrf/DATA/WRF/DET/{yy}/{mm}/{dd}/{cc}/"
+            try:
+                files = fs.ls(prefix)
+                if files:
+                    s3_prefix = prefix
+                    cycle_id = f"{yy}{mm}{dd}_{cc}"
+                    break
+            except FileNotFoundError:
+                continue
+
+        if not s3_prefix:
+            logger.warning(f"[{coord_key}] No SMN cycle found in last 48h!")
+            return
+
+        logger.info(f"[{coord_key}] Processing cycle {cycle_id}...")
+
+        nc_files = sorted([f for f in fs.ls(s3_prefix) if f.endswith(".nc")])
+        logger.info(f"[{coord_key}] Found {len(nc_files)} hourly files")
+
+        cycle_dt = datetime.datetime.strptime(cycle_id, "%Y%m%d_%H")
+        y_idx, x_idx = None, None
+
+        times, t2s, rhs, pps, wspds, wdirs = [], [], [], [], [], []
+
+        for f in nc_files:
+            try:
+                hr_str = f.split("_")[-1].replace(".nc", "")
+                hr_offset = int(hr_str)
+            except Exception:
+                continue
+
+            try:
+                with fs.open(f"s3://{f}") as fobj:
+                    ds = xr.open_dataset(fobj, engine="h5netcdf")
+
+                    if y_idx is None:
+                        lats = ds["lat"].values
+                        lons = ds["lon"].values
+                        y_idx, x_idx = find_nearest_idx(lats, lons, target_lat, target_lon)
+                        real_lat = float(lats[y_idx, x_idx])
+                        real_lon = float(lons[y_idx, x_idx])
+                        dist_km = float(np.sqrt((real_lat - target_lat)**2 + (real_lon - target_lon)**2) * 111)
+                        logger.info(f"[{coord_key}] Grid match: ({real_lat:.4f}, {real_lon:.4f}) | Error: {dist_km:.2f} km")
+
+                    t2 = float(ds["T2"].isel(y=y_idx, x=x_idx).values[0])
+                    rh = float(ds["HR2"].isel(y=y_idx, x=x_idx).values[0])
+                    pp = float(ds["PP"].isel(y=y_idx, x=x_idx).values[0])
+                    wspd = float(ds["magViento10"].isel(y=y_idx, x=x_idx).values[0])
+                    wdir = float(ds["dirViento10"].isel(y=y_idx, x=x_idx).values[0])
+                    ds.close()
+
+                valid_time = cycle_dt + datetime.timedelta(hours=hr_offset)
+                times.append(valid_time.strftime("%Y-%m-%dT%H:00"))
+                t2s.append(round(t2, 1))
+                rhs.append(round(rh, 1))
+                pps.append(round(pp, 2))
+                wspds.append(round(wspd, 1))
+                wdirs.append(round(wdir, 0))
+
+            except Exception as e:
+                logger.warning(f"[{coord_key}] Error at hr={hr_offset}: {e}")
+                continue
+
+        if times:
+            expires = datetime.datetime.utcnow() + datetime.timedelta(hours=12)
+            CACHE[coord_key] = {
+                "expires": expires,
+                "cycle": cycle_id,
+                "data": {
+                    "latitude": target_lat,
+                    "longitude": target_lon,
+                    "generationtime_ms": 0.0,
+                    "utc_offset_seconds": -10800,   # Argentina (UTC-3)
+                    "timezone": "America/Argentina/Buenos_Aires",
+                    "timezone_abbreviation": "ART",
+                    "hourly": {
+                        "time": times,
+                        "temperature_2m": t2s,
+                        "relative_humidity_2m": rhs,
+                        "precipitation": pps,
+                        "wind_speed_10m": wspds,
+                        "wind_direction_10m": wdirs,
+                    }
+                }
+            }
+            logger.info(f"[{coord_key}] Cache built ✅ — {len(times)} hours loaded.")
+        else:
+            logger.error(f"[{coord_key}] No data extracted!")
+
+    finally:
+        DOWNLOADING.discard(coord_key)
+
+
+def refresh_all_known_clients():
+    """Runs in a background thread. Refreshes all known client coordinates."""
+    for client in KNOWN_CLIENTS:
+        coord_key = build_coord_key(client["lat"], client["lon"])
+        entry = CACHE.get(coord_key)
+        if entry and datetime.datetime.utcnow() < entry["expires"]:
+            logger.info(f"[{coord_key}] Cache still valid, skipping refresh.")
+            continue
+        logger.info(f"[{coord_key}] Starting refresh...")
+        fetch_smn_data_sync(client["lat"], client["lon"])
+
+
+@asynccontextmanager
+async def lifespan(app_instance: FastAPI):
+    """On startup: kick off a background thread to pre-load all known client data."""
+    logger.info("=== AgroSpace Backend Starting — Pre-loading SMN WRF data ===")
+    thread = threading.Thread(target=refresh_all_known_clients, daemon=True)
+    thread.start()
+    yield
+    logger.info("=== AgroSpace Backend Shutdown ===")
+
+
+# ─── App ───────────────────────────────────────────────────────────────────
+app = FastAPI(title="AgroSpace SMN WRF 4km API", lifespan=lifespan)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -40,165 +176,59 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global lock/flag to prevent multiple concurrent downloads for the same coords
-downloading_coords = set()
-
-def fetch_smn_data_worker(target_lat: float, target_lon: float):
-    coord_key = f"{target_lat:.4f}_{target_lon:.4f}"
-    if coord_key in downloading_coords:
-        return
-    downloading_coords.add(coord_key)
-    
-    fs = s3fs.S3FileSystem(anon=True)
-    now = datetime.datetime.utcnow()
-    
-    # 1. Detect latest cycle
-    s3_prefix = None
-    cycle_id = None
-    for hour_offset in range(48):
-        test_date = now - datetime.timedelta(hours=hour_offset)
-        year = test_date.strftime("%Y")
-        month = test_date.strftime("%m")
-        day = test_date.strftime("%d")
-        cc = "12" if test_date.hour >= 12 else "00"
-        
-        prefix = f"smn-ar-wrf/DATA/WRF/DET/{year}/{month}/{day}/{cc}/"
-        try:
-            files = fs.ls(prefix)
-            if files:
-                s3_prefix = prefix
-                cycle_id = f"{year}{month}{day}_{cc}"
-                break
-        except FileNotFoundError:
-            continue
-            
-    if not s3_prefix:
-        downloading_coords.remove(coord_key)
-        return
-        
-    print(f"[{coord_key}] Inicia descarga del ciclo {cycle_id}...")
-    
-    try:
-        # 2. Delete old forecast for these coords
-        db = SessionLocal()
-        db.query(Forecast).filter(Forecast.lat == target_lat, Forecast.lon == target_lon).delete()
-        db.commit()
-        
-        # 3. Process the 72 hours
-        files = fs.ls(s3_prefix)
-        files.sort() # Ensure temporal order 000 to 072
-        
-        # We find the nearest neighbor index ONLY ONCE using the first file
-        y_idx, x_idx = None, None
-        cycle_dt = datetime.datetime.strptime(cycle_id, "%Y%m%d_%H")
-        
-        for f in files:
-            if not f.endswith(".nc"): continue
-            
-            # Extract forecast hour (000, 001, etc) from filename WRFDETAR_01H_20260321_00_000.nc
-            try:
-                hr_str = f.split('_')[-1].replace('.nc', '')
-                hr_offset = int(hr_str)
-            except: continue
-            
-            s3_file_obj = fs.open(f"s3://{f}")
-            try:
-                ds = xr.open_dataset(s3_file_obj, engine='h5netcdf')
-            except Exception as e:
-                print(f"Error opening {f}: {e}")
-                continue
-                
-            if y_idx is None:
-                # Map coords
-                lats = ds['lat'].values
-                lons = ds['lon'].values
-                dist = np.sqrt((lats - target_lat)**2 + (lons - target_lon)**2)
-                y_idx, x_idx = np.unravel_index(np.argmin(dist), dist.shape)
-                
-            # Extract point
-            t2 = ds['T2'].isel(y=y_idx, x=x_idx).values[0]
-            rh = ds['HR2'].isel(y=y_idx, x=x_idx).values[0]
-            pp = ds['PP'].isel(y=y_idx, x=x_idx).values[0]
-            w_spd = ds['magViento10'].isel(y=y_idx, x=x_idx).values[0]
-            w_dir = ds['dirViento10'].isel(y=y_idx, x=x_idx).values[0]
-            
-            # Time of this timestep
-            valid_time = cycle_dt + datetime.timedelta(hours=hr_offset)
-            
-            # Save to DB
-            new_record = Forecast(
-                lat=target_lat,
-                lon=target_lon,
-                cycle=cycle_id,
-                time=valid_time,
-                temperature_2m=float(t2),
-                relative_humidity_2m=float(rh),
-                precipitation=float(pp),
-                wind_speed_10m=float(w_spd),
-                wind_direction_10m=float(w_dir)
-            )
-            db.add(new_record)
-            
-            # Periodically commit so frontend can see partial loads
-            if hr_offset % 6 == 0:
-                db.commit()
-                print(f"[{coord_key}] Guardadas {hr_offset} horas...")
-                
-        db.commit()
-        db.close()
-        print(f"[{coord_key}] Carga completada ({len(files)} horas).")
-        
-    finally:
-        downloading_coords.remove(coord_key)
 
 @app.get("/")
 def health_check():
-    return {"status": "AgroSpace SMN WRF 4km API Online"}
+    cached_coords = list(CACHE.keys())
+    return {
+        "status": "AgroSpace SMN WRF 4km API Online",
+        "version": "2.0",
+        "cached_coordinates": cached_coords,
+        "downloading": list(DOWNLOADING),
+    }
+
 
 @app.get("/v1/forecast")
-def get_forecast(latitude: float, longitude: float, background_tasks: BackgroundTasks):
-    db = SessionLocal()
-    
-    # Fix precision to match cache key
-    lat_r = round(latitude, 4)
-    lon_r = round(longitude, 4)
-    
-    # Query future records from DB
-    records = db.query(Forecast).filter(
-        Forecast.lat == lat_r,
-        Forecast.lon == lon_r,
-    ).order_by(Forecast.time).all()
-    
-    db.close()
-    
-    # If no records, trigger background fetch and return "Processing" status
-    if not records:
-        background_tasks.add_task(fetch_smn_data_worker, lat_r, lon_r)
+def get_forecast(latitude: float, longitude: float):
+    coord_key = build_coord_key(latitude, longitude)
+    entry = CACHE.get(coord_key)
+
+    if not entry:
+        # Not a known client — trigger fetch and return partial status
+        if coord_key not in DOWNLOADING:
+            thread = threading.Thread(
+                target=fetch_smn_data_sync, args=(latitude, longitude), daemon=True
+            )
+            thread.start()
         return {
-            "status": "processing", 
-            "message": "Datos de Alta Resolución SMN 4km en descarga desde AWS. El proceso completo demora ~8 minutos. Por favor reintente en breve."
+            "status": "processing",
+            "message": (
+                "Datos SMN WRF 4km en descarga desde AWS (~8 min). "
+                "Por favor, reintente en breve. "
+                f"Coordenadas: {latitude}, {longitude}"
+            ),
         }
-        
-    # Check if the cache is older than 24 hours
-    current_cycle = records[0].cycle
-    cycle_dt = datetime.datetime.strptime(current_cycle, "%Y%m%d_%H")
-    if (datetime.datetime.utcnow() - cycle_dt).total_seconds() > 86400:
-        background_tasks.add_task(fetch_smn_data_worker, lat_r, lon_r) # Trigger stealth background update
-        
-    # Format identical to Open-Meteo
-    return {
-        "latitude": latitude,
-        "longitude": longitude,
-        "generationtime_ms": 0.0,
-        "utc_offset_seconds": 0,
-        "timezone": "GMT",
-        "timezone_abbreviation": "GMT",
-        "hourly": {
-            "time": [r.time.strftime("%Y-%m-%dT%H:00") for r in records],
-            "temperature_2m": [round(r.temperature_2m, 1) for r in records],
-            "relative_humidity_2m": [round(r.relative_humidity_2m, 1) for r in records],
-            "precipitation": [round(r.precipitation, 2) for r in records],
-            "wind_speed_10m": [round(r.wind_speed_10m, 1) for r in records],
-            "wind_direction_10m": [round(r.wind_direction_10m, 0) for r in records]
+
+    # Trigger background refresh if expired (serve stale data meanwhile)
+    if datetime.datetime.utcnow() >= entry["expires"]:
+        if coord_key not in DOWNLOADING:
+            thread = threading.Thread(
+                target=fetch_smn_data_sync, args=(latitude, longitude), daemon=True
+            )
+            thread.start()
+
+    return entry["data"]
+
+
+@app.get("/v1/status")
+def get_status():
+    status = {}
+    for key, entry in CACHE.items():
+        hours = len(entry["data"]["hourly"]["time"])
+        expires_in = (entry["expires"] - datetime.datetime.utcnow()).total_seconds() / 3600
+        status[key] = {
+            "cycle": entry["cycle"],
+            "hours_cached": hours,
+            "expires_in_hours": round(expires_in, 1),
         }
-    }
+    return {"cache": status, "downloading": list(DOWNLOADING)}
