@@ -22,6 +22,18 @@ KNOWN_CLIENTS = [
     {"lat": -36.2086, "lon": -61.87869},  # Campo Marina Blasco
 ]
 
+# La corrida del SMN se nombra en UTC; la respuesta se declara en hora argentina
+# (utc_offset_seconds = -10800) y la plataforma empareja estas horas con las de
+# Open-Meteo, que vienen en hora local. Sin esta conversión cada valor quedaba
+# rotulado 3 h más tarde de lo que correspondía.
+ART_OFFSET = datetime.timedelta(hours=-3)
+
+# El NetCDF declara magViento10 en "meter / second". La API lo publica como
+# wind_speed_10m en km/h, la misma unidad que Open-Meteo y que muestra la
+# plataforma al lado de las ráfagas.
+MS_TO_KMH = 3.6
+
+
 def build_coord_key(lat: float, lon: float) -> str:
     return f"{round(lat, 4)}_{round(lon, 4)}"
 
@@ -101,12 +113,12 @@ def fetch_smn_data_sync(target_lat: float, target_lon: float):
                     wdir = float(ds["dirViento10"].isel(y=y_idx, x=x_idx).values[0])
                     ds.close()
 
-                valid_time = cycle_dt + datetime.timedelta(hours=hr_offset)
+                valid_time = cycle_dt + datetime.timedelta(hours=hr_offset) + ART_OFFSET
                 times.append(valid_time.strftime("%Y-%m-%dT%H:00"))
                 t2s.append(round(t2, 1))
                 rhs.append(round(rh, 1))
                 pps.append(round(pp, 2))
-                wspds.append(round(wspd, 1))
+                wspds.append(round(wspd * MS_TO_KMH, 1))
                 wdirs.append(round(wdir, 0))
 
             except Exception as e:
@@ -182,7 +194,7 @@ def health_check():
     cached_coords = list(CACHE.keys())
     return {
         "status": "AgroSpace SMN WRF 4km API Online",
-        "version": "2.0",
+        "version": "2.1",
         "cached_coordinates": cached_coords,
         "downloading": list(DOWNLOADING),
     }
