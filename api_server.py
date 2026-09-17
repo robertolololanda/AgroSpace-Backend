@@ -78,7 +78,12 @@ def fetch_smn_data_sync(target_lat: float, target_lon: float):
 
         logger.info(f"[{coord_key}] Processing cycle {cycle_id}...")
 
-        nc_files = sorted([f for f in fs.ls(s3_prefix) if f.endswith(".nc")])
+        # Cada corrida publica tres familias: 01H (horaria, con T2, HR2, PP y
+        # viento), 10M (solo precipitación cada 10 min) y 24H (acumulados
+        # diarios). Solo la horaria tiene lo que se extrae; las otras dos
+        # sumaban 76 archivos y ~0,74 GB por corrida que se bajaban y fallaban.
+        nc_files = sorted(f for f in fs.ls(s3_prefix)
+                          if "WRFDETAR_01H_" in f and f.endswith(".nc"))
         logger.info(f"[{coord_key}] Found {len(nc_files)} hourly files")
 
         cycle_dt = datetime.datetime.strptime(cycle_id, "%Y%m%d_%H")
@@ -194,7 +199,7 @@ def health_check():
     cached_coords = list(CACHE.keys())
     return {
         "status": "AgroSpace SMN WRF 4km API Online",
-        "version": "2.1",
+        "version": "2.2",
         "cached_coordinates": cached_coords,
         "downloading": list(DOWNLOADING),
     }
